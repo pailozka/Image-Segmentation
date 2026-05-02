@@ -2,6 +2,7 @@
 # This file should be used for performing inference on a network
 # Usage: inference.py <path_2_dataset> <path_2_model> (<int_number_of_samples>)
 import sys
+import os
 import numpy as np
 from dataset import SampleDataset
 import torch
@@ -34,11 +35,11 @@ def infer_all(net, batch_size, dataloader, device):
             pred = net(xb).to(dtype = torch.float32)
             pred = np.array(pred.cpu().detach())
             pred = np.argmax(np.array(pred), axis=1)
-            for i in range(pred.shape[0]):
+            for j in range(pred.shape[0]):
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7))
-                ax1.imshow(pred[i])
+                ax1.imshow(pred[j])
                 ax1.set_title("Predicted")
-                ax2.imshow(yb[i])
+                ax2.imshow(yb[j])
                 ax2.set_title("Mask")
                 plt.savefig(f"./output_predictions/prediction_{counter}.png")
                 plt.clf()
@@ -63,7 +64,7 @@ def inference(dataset_path, model_path, n_samples):
     Returns:
     - None
     """
-    # Check for available GPU
+    os.makedirs("output_predictions", exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Computing with {}!'.format(device))
 

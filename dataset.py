@@ -4,6 +4,7 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 from skimage import color, io
+from skimage.color import gray2rgb, rgba2rgb
 import os
 import zipfile
 import re
@@ -75,12 +76,16 @@ class SampleDataset(Dataset):
         self.transform = transforms
 
     def mask_to_labels(self, mask):
-        labels_tensor = torch.zeros(mask.size(0), mask.size(1), 8, dtype = torch.float32)
-        for i, kl in enumerate(mask):
-                for j, triplet in enumerate(kl):
-                    data = tuple(triplet.tolist())
-                    if data in reverse_label_dict:
-                        labels_tensor[i][j][labels[reverse_label_dict[data]]] = 1
+        # Build a class index map vectorially instead of looping over every pixel
+        H, W = mask.size(0), mask.size(1)
+        class_map = torch.zeros(H, W, dtype=torch.long)
+        for rgb, name in reverse_label_dict.items():
+            color_tensor = torch.tensor(rgb, dtype=mask.dtype)
+            match = (mask == color_tensor).all(dim=-1)
+            class_map[match] = labels[name]
+        # Return one-hot so existing calling code (argmax) still works
+        labels_tensor = torch.zeros(H, W, 8, dtype=torch.float32)
+        labels_tensor.scatter_(2, class_map.unsqueeze(-1), 1.0)
         return labels_tensor
 
     def __len__(self):

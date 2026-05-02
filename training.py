@@ -24,7 +24,6 @@ import dagshub
 import mlflow
 import mlflow.pytorch
 import time
-from torch.autograd import Variable
 import numpy as np
 
 
@@ -89,13 +88,13 @@ class EarlyStopping_Callback:
         if self.best_valid_loss is None:
             self.best_valid_loss = valid_loss
 
-        elif abs(valid_loss - self.best_valid_loss ) < self.delta:
-            
+        elif self.best_valid_loss - valid_loss > self.delta:
+            self.best_valid_loss = valid_loss
+            self.increasing_steps = 0
+
+        else:
             self.increasing_steps += 1
             print(f'{self.increasing_steps} without improvement')
-
-        elif self.best_valid_loss > valid_loss:
-            self.best_valid_loss = valid_loss
             
         if self.increasing_steps == self.patience:
             return True
@@ -133,11 +132,9 @@ def custom_accuracy_score(y_true, y_pred):
     y_true and y_pred are torch tensors
     '''
     y_true = np.array(y_true.cpu().detach())
-    y_pred = np.array(y_pred.cpu().detach())
-    #print(y_true.shape, y_pred.shape)
-    y_pred = np.argmax(np.array(y_pred), axis=1)
-    #print(y_true.shape, y_pred.shape)
-    return np.sum(y_pred == y_true) / len(y_pred)
+    y_pred = np.argmax(np.array(y_pred.cpu().detach()), axis=1)
+    # divide by total pixels, not just batch size
+    return np.sum(y_pred == y_true) / y_true.size
 
     
 def loss_batch(model, loss_func, xb, yb, dev, opt=None):
@@ -200,8 +197,8 @@ def fit(net, batch_size, epochs, trainloader, validloader, loss_fn, optimizer, d
             after_lr = optimizer.param_groups[0]["lr"]
             mlflow.log_metric("learning rate", before_lr, step=epoch)
             print("Epoch %d: Optimizer lr %.7f -> %.7f" % (epoch, before_lr, after_lr))
-        mlflow.log_metric("training loss", loss)
-        mlflow.log_metric("validation loss", val_loss)
+        mlflow.log_metric("training loss", loss, step=epoch)
+        mlflow.log_metric("validation loss", val_loss, step=epoch)
         print('Epoch {}, train loss: {:.5f}, val loss: {:.5f}'.format(epoch, loss, val_loss))
         train_losses.append(loss)
         validation_losses.append(val_loss)
@@ -251,7 +248,7 @@ def training(dataset_path):
     
     train_df, valid_df = train_test_split(df, test_size=.1, random_state=params['random_state'])
     print(train_df.shape, valid_df.shape)
-    train_ds = SampleDataset(train_df, transforms)
+    train_ds = SampleDataset(train_df, transforms_train)
     valid_ds = SampleDataset(valid_df, transforms)
     
     trainloader = torch.utils.data.DataLoader(train_ds,
