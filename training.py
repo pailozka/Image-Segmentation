@@ -1,307 +1,257 @@
-# Description:
-# This file should be used for performing training of a network
-# Usage: python training.py <path_2_dataset>
+"""Reproducible training: python training.py DATA --config configs/attention.json."""
 
-##############  IMPORTS  ##############
-import zipfile
-import sys
-import matplotlib.pyplot as plt
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import torch
-from torchview import draw_graph
-#from network import ModelExample
-from pathlib import Path
-from dataset import SampleDataset
-import re
-import pandas as pd
-import os
-from skimage import color, io
-from sklearn.model_selection import train_test_split
-from network import UNet
-from dataset import extract_seg_dataset, get_dataframe
-import dagshub
-import mlflow
-import mlflow.pytorch
+import argparse
+import csv
 import time
-import numpy as np
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+
+from config import TrainConfig
+from dataset import IGNORE_INDEX, SegmentationDataset, discover_samples, sequence_group, split_samples
+from losses import CrossEntropyDiceLoss
+from metrics import SegmentationMetrics
+from network import build_model
+from utils import (
+    environment_info,
+    load_checkpoint,
+    resolve_device,
+    sample_manifest,
+    save_checkpoint,
+    seed_everything,
+    seed_worker,
+    write_json,
+)
 
 
-######################################
-
-torch.manual_seed(42)
-
-img_size = 128
-transforms_train = A.Compose([
-                         # augmentation 
-                         #A.ColorJitter(brightness=.5, contrast=.5, saturation=.5, hue=.1),
-                         #A.GaussNoise(),
-                         #A.HorizontalFlip(p=0.5),
-                         #A.ShiftScaleRotate(rotate_limit=30, p=1, border_mode=0, value=0),
-                         #A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.5),
-                            
-                         # preprocessing
-                         A.SmallestMaxSize (img_size),
-                         A.CenterCrop(img_size, img_size),
-                         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                         ToTensorV2(),
-                        ]   
-                    )
-transforms = A.Compose([
-                         # preprocessing
-                         A.SmallestMaxSize (img_size),
-                         A.CenterCrop(img_size, img_size),
-                         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                         ToTensorV2(),
-                        ]   
-                    )
-
-class BestModel_Callback:
-
-    def __init__(self, model_path):
-        
-        self.best_valid_loss = float('inf')
-        self.model_path = model_path
-        
-    def __call__(self, model, valid_loss):
-        
-        if valid_loss < self.best_valid_loss:
-            
-            print(f"Saving model {self.model_path} with validation {valid_loss:.3f}")
-            self.best_valid_loss = valid_loss
-            torch.save(model, self.model_path)
-
-class EarlyStopping_Callback:
-
-    def __init__(self,
-                 patience=5, delta = 1e-5,
-                 #best_valid_loss=float('inf')
-                 ):
-        #self.best_valid_loss = best_valid_loss
-        self.best_valid_loss = None
-        self.delta = delta
-        self.patience = patience
-        self.increasing_steps = 0
-        
-    def __call__(self, valid_loss):
-
-        if self.best_valid_loss is None:
-            self.best_valid_loss = valid_loss
-
-        elif self.best_valid_loss - valid_loss > self.delta:
-            self.best_valid_loss = valid_loss
-            self.increasing_steps = 0
-
-        else:
-            self.increasing_steps += 1
-            print(f'{self.increasing_steps} without improvement')
-            
-        if self.increasing_steps == self.patience:
-            return True
-        
-        return False
-    
-# sample function for model architecture visualization
-# draw_graph function saves an additional file: Graphviz DOT graph file, it's not necessary to delete it
-def draw_network_architecture(network, input_sample):
-    # saves visualization of model architecture to the model_architecture.png
-    model_graph = draw_graph(network, input_sample, graph_dir='LR', save_graph=True, filename="model_architecture")
-
-
-# sample function for losses visualization
-def plot_learning_curves(train_losses, validation_losses):
-    plt.figure(figsize=(10, 5))
-    plt.title("Train and Evaluation Losses During Training")
-    plt.plot(train_losses, label="train_loss")
-    plt.plot(validation_losses, label="validation_loss")
-    plt.xlabel("iterations")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.savefig("learning_curves.png")
-
-
-def lr_lambda(epoch):
-    # LR to be 0.1 * (1/1+0.01*epoch)
-    base_lr = 0.01
-    factor = 0.01
-    return base_lr/(1+factor*epoch)
-
-
-def custom_accuracy_score(y_true, y_pred):
-    '''
-    y_true and y_pred are torch tensors
-    '''
-    y_true = np.array(y_true.cpu().detach())
-    y_pred = np.argmax(np.array(y_pred.cpu().detach()), axis=1)
-    # divide by total pixels, not just batch size
-    return np.sum(y_pred == y_true) / y_true.size
-
-    
-def loss_batch(model, loss_func, xb, yb, dev, opt=None):
-    xb, yb = xb.to(dev), yb.to(dev)
-    pred = model(xb).to(dtype = torch.float32)
-    loss = loss_func(pred, yb)
-    acc = custom_accuracy_score(yb, pred)
-    #print(f"Loss: {loss}")
-    #print(f"Acc: {acc}")
-    if opt is not None:
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-    return loss.item(), len(xb), acc
-    
-def train(model, train_dl, loss_func, dev, opt):
-    model.train()
-    current_loss = 0.0
-    loss, size = 0, 0
-    total_acc = 0.0
-    for b_idx, (xb, yb) in enumerate(train_dl):
-        b_loss, b_size, acc = loss_batch(model, loss_func, xb, yb, dev, opt)
-        current_loss += b_loss
-        total_acc += acc
-        if b_idx % 100 == 99:
-           loss_minibatch = current_loss / 100
-           acc_minibatch = total_acc / 100
-           print('Loss after 100 batches %5d: %.3f' % (b_idx + 1, loss_minibatch))
-           print('Accuracy after 100 batches %5d: %.3f' % (b_idx + 1, acc_minibatch))
-           #mlflow.log_metric("100 batches_loss", loss_minibatch, step=b_idx+1)
-           #mlflow.log_metric("100 batches_accuracy", acc_minibatch, step=b_idx+1)
-           current_loss = 0.0
-           total_acc = 0.0
-        loss += b_loss * b_size
-        size += b_size
-        
-    return loss / size
-    
-def validate(model, valid_dl, loss_func, dev, opt=None):
-        model.eval()
-        with torch.no_grad():
-            losses, nums, accs = zip(
-                *[loss_batch(model, loss_func, xb, yb, dev) for xb, yb in valid_dl]
-            )
-            
-        return np.sum(np.multiply(losses, nums)) / np.sum(nums)
-
-# sample function for training
-def fit(net, batch_size, epochs, trainloader, validloader, loss_fn, optimizer, device, scheduler = None):
-    train_losses = []
-    validation_losses = []
-    best_model = BestModel_Callback(model_path='best_model.pt')
-    early_stopping = EarlyStopping_Callback(patience=5)
-    for epoch in range(epochs):
-        loss = train(net, trainloader, loss_fn, device, optimizer)
-        val_loss = validate(net, validloader, loss_fn, device) 
-        if scheduler is not None:
-            before_lr = optimizer.param_groups[0]["lr"]
-            scheduler.step()
-            after_lr = optimizer.param_groups[0]["lr"]
-            mlflow.log_metric("learning rate", before_lr, step=epoch)
-            print("Epoch %d: Optimizer lr %.7f -> %.7f" % (epoch, before_lr, after_lr))
-        mlflow.log_metric("training loss", loss, step=epoch)
-        mlflow.log_metric("validation loss", val_loss, step=epoch)
-        print('Epoch {}, train loss: {:.5f}, val loss: {:.5f}'.format(epoch, loss, val_loss))
-        train_losses.append(loss)
-        validation_losses.append(val_loss)
-        best_model(net, val_loss)
-        if early_stopping(val_loss):
-            print(f'Early Stopping: epoch {epoch}, val_loss {val_loss:.3f}')
-            break 
-
-    print('Training finished!')
-    return train_losses, validation_losses
-
-# declaration for this function should not be changed
-def training(dataset_path):
-    """
-    training(dataset_path) performs training on the given dataset;
-    saves:
-    - model.pt (trained model)
-    - learning_curves.png (learning curves generated during training)
-    - model_architecture.png (a scheme of model's architecture)
-
-    Parameters:
-    - dataset_path (string): path to a dataset
-
-    Returns:
-    - None
-    """
-    start_time = time.time()
-    print("********************************** STARTING **********************************")
-    params = {
-        "info":"Image segmentation",
-        "learning_rate": 0.0001,
-        "batch_size": 4,
-        "epochs" : 5,
-        "random_state": 22,
-        "weight_decay" : 0.1,
-        "epsilon":1e-08,
-        "Softmax": True,
-        "Adam" : True
-    }
-    print(params)
-    mlflow.log_params(params)
-    # Check for available GPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    #device = 'cpu'
-    print('Computing with {}!'.format(device))
-    df = extract_seg_dataset(dataset_path)
-    
-    train_df, valid_df = train_test_split(df, test_size=.1, random_state=params['random_state'])
-    print(train_df.shape, valid_df.shape)
-    train_ds = SampleDataset(train_df, transforms_train)
-    valid_ds = SampleDataset(valid_df, transforms)
-    
-    trainloader = torch.utils.data.DataLoader(train_ds,
-                      batch_size=params['batch_size'],
-                      shuffle=True,
-                      num_workers=1)
-
-    valloader = torch.utils.data.DataLoader(valid_ds,
-                      batch_size=params['batch_size'],
-                      shuffle=True,
-                      num_workers=1)
-    
-    net = UNet(num_class = 8).to(device)
-    input_sample = torch.zeros((1, 3, 128, 128))
-    draw_network_architecture(net, input_sample)
-    # define optimizer and learning rate
-    if params["Adam"]:
-        optimizer = torch.optim.Adam(net.parameters(), lr=params['learning_rate'], eps = params['epsilon'])
-        #optimizer = torch.optim.AdamW(net.parameters(), lr=params['learning_rate'], weight_decay = params['weight_decay'], betas=(0.9, 0.999), eps=1e-08)
-        print("Adam optimizer is used")
+def prepare_splits(root, config):
+    root = Path(root)
+    if (root / "data_seg_public").is_dir():
+        root = root / "data_seg_public"
+    image_root = root / ("leftImg8bit" if (root / "leftImg8bit").is_dir() else "img")
+    if (image_root / "train").is_dir() or (image_root / "val").is_dir():
+        train = discover_samples(root, config.encoding, "train")
+        val = discover_samples(root, config.encoding, "val")
+        train_sequences = {sequence_group(s.key) for s in train} - {None}
+        val_sequences = {sequence_group(s.key) for s in val} - {None}
+        if train_sequences & val_sequences:
+            raise ValueError("Sequence groups overlap between train and validation")
     else:
-        optimizer = torch.optim.SGD(net.parameters(), lr=params['learning_rate'], momentum=0.9, nesterov = True)
-        print("SGD optimizer is used")
-    # optimizer = torch.optim.AdamW(net.parameters(), lr=params['learning_rate'], weight_decay = params['weight_decay'], betas=(0.9, 0.999), eps=1e-08)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.1)
-    #scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda) 
-    print("Learning rate init: ", optimizer.param_groups[0]['lr'])
-    # define loss function
-    loss_fn = torch.nn.CrossEntropyLoss()
-    # train the network for three epochs
-    tr_losses, val_losses = fit(net, params['batch_size'], params['epochs'], trainloader, valloader, loss_fn, optimizer, device, scheduler)
-    # save the trained model and plot the losses, feel free to create your own functions
-    print("Saving")
-    torch.save(net, 'model.pt')
-    plot_learning_curves(tr_losses, val_losses)
-    print("********************************** ENDING **********************************")
-    print("--- %s seconds ---" % (time.time() - start_time))
-    return
+        # Never silently mix an official test split into a random training split.
+        if (image_root / "test").exists():
+            raise ValueError("A test directory exists but train/val directories are missing")
+        train, val = split_samples(discover_samples(root, config.encoding), config.val_fraction, config.seed)
+    manifest = {"train": sample_manifest(train), "val": sample_manifest(val)}
+    if {s["image_sha256"] for s in manifest["train"]} & {s["image_sha256"] for s in manifest["val"]}:
+        raise ValueError("Identical image content occurs in both training and validation")
+    return train, val, manifest
 
 
-def get_arguments():
-    if len(sys.argv) != 2:
-        print("Usage: python training.py <path_2_dataset> ")
-        sys.exit(1)
+def make_loader(samples, config, workers, training=False, epoch=0, device="cpu"):
+    dataset = SegmentationDataset(
+        samples,
+        config.image_size,
+        config.encoding,
+        augment=training and config.augment,
+        ignore_void=config.ignore_void,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=training,
+        num_workers=workers,
+        pin_memory=str(device).startswith("cuda"),
+        worker_init_fn=seed_worker,
+        generator=torch.Generator().manual_seed(config.seed + epoch),
+    )
 
-    try:
-        path = sys.argv[1]
-    except Exception as e:
-        print(e)
-        sys.exit(1)
-    return path
+
+def run_epoch(model, loader, criterion, device, config, optimizer=None, scaler=None):
+    is_training = optimizer is not None
+    model.train(is_training)
+    metrics = SegmentationMetrics(excluded_classes=(0,) if config.ignore_void else (), device=device)
+    total_loss, images = 0.0, 0
+    with torch.set_grad_enabled(is_training):
+        for image, target in loader:
+            image, target = image.to(device), target.to(device)
+            # Skip all-ignored batches, including the optimizer's weight decay.
+            if not (target != IGNORE_INDEX).any():
+                continue
+            if is_training:
+                optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, enabled=config.amp and device.type == "cuda"):
+                logits = model(image)
+                loss = criterion(logits, target)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Non-finite loss; check data and optimizer settings")
+            if is_training:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip, error_if_nonfinite=True)
+                scaler.step(optimizer)
+                scaler.update()
+            total_loss += loss.item() * len(image)
+            images += len(image)
+            metrics.update(logits.detach(), target)
+    result = metrics.compute()
+    if not images or result["mean_iou"] is None:
+        raise ValueError("No evaluable pixels; check mask encoding and ignore policy")
+    result["loss"] = total_loss / images
+    return result
+
+
+def write_history(output, history):
+    write_json(output / "history.json", history)
+    with (output / "history.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=["epoch", "learning_rate", "train_loss", "val_loss", "val_mean_iou", "val_mean_dice"],
+        )
+        writer.writeheader()
+        for row in history:
+            writer.writerow(
+                {
+                    "epoch": row["epoch"],
+                    "learning_rate": row["learning_rate"],
+                    "train_loss": row["train"]["loss"],
+                    "val_loss": row["val"]["loss"],
+                    "val_mean_iou": row["val"]["mean_iou"],
+                    "val_mean_dice": row["val"]["mean_dice"],
+                }
+            )
+
+
+def training(dataset_path, config=None, output="runs/default", device="auto", workers=0, resume=None):
+    config = config or TrainConfig()
+    output, device = Path(output), resolve_device(device)
+    if workers < 0:
+        raise ValueError("workers must be nonnegative")
+    if output.exists() and any(output.iterdir()) and resume is None:
+        raise FileExistsError(f"Run directory is not empty: {output}; use a new output or --resume")
+    if resume and Path(resume).resolve() != (output / "last.pt").resolve():
+        raise ValueError("Resume from this run's last.pt and use the same --output directory")
+    seed_everything(config.seed, config.deterministic)
+    train, val, manifest = prepare_splits(dataset_path, config)
+    checkpoint = None
+    if resume:
+        model, checkpoint = load_checkpoint(resume, device)
+        if checkpoint["config"] != config.to_dict() or checkpoint["splits"] != manifest:
+            raise ValueError("Resume requires identical configuration and dataset contents/splits")
+        if checkpoint["workers"] != workers or checkpoint["environment"]["device"] != str(device):
+            raise ValueError("Resume requires the original worker count and device")
+        if not (output / "best.pt").is_file():
+            raise FileNotFoundError("Resume requires best.pt alongside last.pt")
+    else:
+        model = build_model(config.model).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.epochs, eta_min=config.learning_rate * 0.01
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=config.amp and device.type == "cuda")
+    criterion = CrossEntropyDiceLoss(config.dice_weight)
+    start_epoch, best_iou, stale, history = 0, -1.0, 0, []
+    if checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        scaler.load_state_dict(checkpoint["scaler_state"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_iou, stale, history = checkpoint["best_iou"], checkpoint["stale_epochs"], checkpoint["history"]
+    output.mkdir(parents=True, exist_ok=True)
+    environment = environment_info(device)
+    write_json(output / "config.json", config.to_dict())
+    write_json(output / "splits.json", manifest)
+    write_json(output / "environment.json", environment)
+    print(
+        f"{device}: {len(train)} train / {len(val)} validation; {sum(p.numel() for p in model.parameters()):,} parameters",
+        flush=True,
+    )
+    if stale >= config.patience:
+        print("This run already met the early-stopping condition.")
+    for epoch in range(start_epoch, config.epochs):
+        if stale >= config.patience:
+            break
+        # Epoch-derived RNG streams make restart at epoch boundaries reproducible,
+        # including augmentation, shuffling, dropout and worker process seeds.
+        seed_everything(config.seed + epoch, config.deterministic)
+        started = time.perf_counter()
+        learning_rate = optimizer.param_groups[0]["lr"]
+        train_result = run_epoch(
+            model,
+            make_loader(train, config, workers, True, epoch, device),
+            criterion,
+            device,
+            config,
+            optimizer,
+            scaler,
+        )
+        val_result = run_epoch(
+            model, make_loader(val, config, workers, device=device), criterion, device, config
+        )
+        scheduler.step()
+        score = val_result["mean_iou"]
+        improved = score > best_iou
+        significant = score > best_iou + config.min_delta
+        stale = 0 if significant else stale + 1
+        if improved:
+            best_iou = score
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "learning_rate": learning_rate,
+                "seconds": time.perf_counter() - started,
+                "train": train_result,
+                "val": val_result,
+            }
+        )
+        payload = {
+            "format_version": 1,
+            "config": config.to_dict(),
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict(),
+            "best_iou": best_iou,
+            "stale_epochs": stale,
+            "history": history,
+            "splits": manifest,
+            "environment": environment,
+            "workers": workers,
+        }
+        if improved:
+            save_checkpoint(output / "best.pt", payload)
+            write_json(output / "best_metrics.json", {"epoch": epoch + 1, **val_result})
+        save_checkpoint(output / "last.pt", payload)
+        write_history(output, history)
+        print(
+            f"Epoch {epoch + 1}/{config.epochs} loss={train_result['loss']:.4f} val_loss={val_result['loss']:.4f} mIoU={score:.4f}",
+            flush=True,
+        )
+    write_history(output, history)
+    return history
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("dataset", type=Path)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--output", type=Path, default=Path("runs/default"))
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--resume", type=Path)
+    args = parser.parse_args()
+    if args.config:
+        config = TrainConfig.load(args.config)
+    elif args.resume:
+        _, checkpoint = load_checkpoint(args.resume)
+        config = TrainConfig.from_dict(checkpoint["config"])
+    else:
+        config = TrainConfig()
+    training(args.dataset, config, args.output, args.device, args.workers, args.resume)
 
 
 if __name__ == "__main__":
-    path_2_dataset = get_arguments()
-    training(path_2_dataset)
+    main()

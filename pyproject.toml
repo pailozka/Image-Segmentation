@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "urban-segmentation-lab"
+version = "0.2.0"
+description = "Reproducible category-level street-scene segmentation with residual attention U-Nets"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.6,<3", "numpy>=1.26,<3", "Pillow>=10.4,<14"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+plots = ["matplotlib>=3.8,<4"]
+
+[project.scripts]
+segment-train = "training:main"
+segment-evaluate = "evaluate:main"
+segment-predict = "inference:main"
+
+[tool.setuptools]
+py-modules = ["network", "dataset", "config", "losses", "metrics", "utils", "training", "evaluate", "inference"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
